@@ -145,6 +145,13 @@ class RocketChatAdapter(BasePlatformAdapter):
     # registry entry -- it is not injected back into the adapter.
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
+    # Rocket.Chat has its own slash-command registry and the client intercepts
+    # "/" input, so an unregistered "/approve" may never reach us as a message
+    # -- which would break the approval flow including its text fallback. Slack
+    # and Matrix switch to "!" for the same reason. Prompts the core shows the
+    # user are rendered with this prefix, so they read "!approve".
+    typed_command_prefix = "!"
+
     # Reaction ack. The base on_processing_complete drives the whole flow
     # (👀 while working, ✅/❌ on completion) but returns immediately unless at
     # least one of these is set and _add_reaction/_remove_reaction exist.

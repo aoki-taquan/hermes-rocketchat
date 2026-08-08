@@ -562,3 +562,21 @@ class TestListChannels:
         adapter = make_adapter()
         adapter._api_get = AsyncMock(return_value={})
         assert run(adapter.list_channels()) == []
+
+
+class TestTypedCommandPrefix:
+    def test_uses_bang_not_slash(self, rc_module):
+        """Rocket.Chat has its own slash-command registry and the client
+        intercepts "/" input, so an unregistered "/approve" may never arrive as
+        a message -- taking the approval flow's text fallback with it. Slack
+        and Matrix switch to "!" for the same reason."""
+        assert rc_module.RocketChatAdapter.typed_command_prefix == "!"
+
+    def test_differs_from_base_default(self, rc_module):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        assert BasePlatformAdapter.typed_command_prefix == "/"
+        assert (
+            rc_module.RocketChatAdapter.typed_command_prefix
+            != BasePlatformAdapter.typed_command_prefix
+        )
