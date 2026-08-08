@@ -309,3 +309,44 @@ class TestEditMessage:
 
         _, payload = adapter._api_post.await_args.args
         assert len(payload["text"]) <= rc_module.MAX_MESSAGE_LENGTH
+
+
+class TestDeleteMessage:
+    def test_overrides_base_implementation(self, rc_module):
+        """Required for display.cleanup_progress -- without an override the
+        core cannot remove the tool-progress messages it posted."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        assert (
+            rc_module.RocketChatAdapter.delete_message
+            is not BasePlatformAdapter.delete_message
+        )
+
+    def test_signature_matches_base_class(self, rc_module):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        ours = inspect.signature(rc_module.RocketChatAdapter.delete_message)
+        base = inspect.signature(BasePlatformAdapter.delete_message)
+        assert ours.parameters.keys() == base.parameters.keys()
+
+    def test_calls_chat_delete(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True})
+
+        assert run(adapter.delete_message("room1", "msg1")) is True
+
+        endpoint, payload = adapter._api_post.await_args.args
+        assert endpoint == "chat.delete"
+        assert payload["roomId"] == "room1"
+        assert payload["msgId"] == "msg1"
+
+    def test_requires_message_id(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock()
+        assert run(adapter.delete_message("room1", "")) is False
+        adapter._api_post.assert_not_awaited()
+
+    def test_failure_returns_false(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": False})
+        assert run(adapter.delete_message("room1", "msg1")) is False

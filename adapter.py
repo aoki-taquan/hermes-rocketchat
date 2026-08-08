@@ -542,6 +542,21 @@ class RocketChatAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Failed to edit message")
         return SendResult(success=True, message_id=message_id)
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a message via ``chat.delete``.
+
+        Needed for ``display.cleanup_progress``: the core collects the ids of
+        the tool-progress messages it posted and deletes them once the answer
+        is in. Without this the room keeps every "🐍 Running code …" line
+        forever, since the fallback is to leave them in place.
+        """
+        if not message_id:
+            return False
+        data = await self._api_post(
+            "chat.delete", {"roomId": chat_id, "msgId": message_id, "asUser": True}
+        )
+        return bool(data and data.get("success"))
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         data = await self._api_get("rooms.info", {"roomId": chat_id})
         room = data.get("room") if isinstance(data, dict) else None
