@@ -5,6 +5,7 @@ Upstream (wachtelhund/hermes-rocketchat-gateway) stopped being updated on
 quietly reintroduce them:
 
 * ``connect(is_reconnect=...)`` — without it the plugin does not load at all
+* ``edit_message`` — without it the core drops all live progress updates
 * typing indicator — sent over the modern ``user-activity`` event
 * attachment fetching — must not leak the bot's token or become an SSRF probe
 
@@ -247,3 +248,64 @@ class TestAttachmentUrlResolution:
 
     def test_size_limit_is_configured(self, rc_module):
         assert rc_module._MAX_ATTACHMENT_BYTES > 0
+
+
+# ---------------------------------------------------------------------------
+# Live progress (message editing)
+# ---------------------------------------------------------------------------
+
+class TestEditMessage:
+    def test_overrides_base_implementation(self, rc_module):
+        """The core drops tool-progress/streaming updates entirely when an
+        adapter leaves edit_message at the base implementation
+        (gateway/run.py checks identity against BasePlatformAdapter)."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        assert (
+            rc_module.RocketChatAdapter.edit_message
+            is not BasePlatformAdapter.edit_message
+        )
+
+    def test_signature_matches_base_class(self, rc_module):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        ours = inspect.signature(rc_module.RocketChatAdapter.edit_message)
+        base = inspect.signature(BasePlatformAdapter.edit_message)
+        assert ours.parameters.keys() == base.parameters.keys()
+
+    def test_calls_chat_update(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True})
+
+        result = run(adapter.edit_message("room1", "msg1", "updated"))
+
+        assert result.success is True
+        assert result.message_id == "msg1"
+        endpoint, payload = adapter._api_post.await_args.args
+        assert endpoint == "chat.update"
+        assert payload["roomId"] == "room1"
+        assert payload["msgId"] == "msg1"
+        assert payload["text"] == "updated"
+
+    def test_requires_message_id(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock()
+        result = run(adapter.edit_message("room1", "", "x"))
+        assert result.success is False
+        adapter._api_post.assert_not_awaited()
+
+    def test_failure_is_reported_so_caller_can_fall_back(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": False})
+        result = run(adapter.edit_message("room1", "msg1", "x"))
+        assert result.success is False
+
+    def test_oversized_content_is_truncated(self, make_adapter, rc_module):
+        """An edit cannot be split across messages the way send() chunks."""
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True})
+
+        run(adapter.edit_message("room1", "msg1", "x" * (rc_module.MAX_MESSAGE_LENGTH + 500)))
+
+        _, payload = adapter._api_post.await_args.args
+        assert len(payload["text"]) <= rc_module.MAX_MESSAGE_LENGTH

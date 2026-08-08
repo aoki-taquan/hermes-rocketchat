@@ -507,6 +507,41 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         return SendResult(success=True, message_id=last_id)
 
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a message in place via ``chat.update``.
+
+        This is what unlocks live progress. The core checks whether an adapter
+        overrides ``edit_message`` at all (``gateway/run.py``) and, when it does
+        not, drops streaming/tool-progress updates entirely rather than posting
+        a new message per step. Without this the room only ever sees the typing
+        indicator and then the final answer.
+
+        ``finalize`` is a no-op here: Rocket.Chat has no separate "in progress"
+        message state, so an edit is just an edit.
+        """
+        if not message_id:
+            return SendResult(success=False, error="edit_message requires a message id")
+
+        formatted = self.format_message(content)
+        # An edit cannot be split across messages; keep it within one.
+        if len(formatted) > MAX_MESSAGE_LENGTH:
+            formatted = formatted[: MAX_MESSAGE_LENGTH - 1] + "…"
+
+        data = await self._api_post(
+            "chat.update", {"roomId": chat_id, "msgId": message_id, "text": formatted}
+        )
+        if not data or not data.get("success", bool(data.get("message"))):
+            # Callers fall back to sending a fresh message on failure.
+            return SendResult(success=False, error="Failed to edit message")
+        return SendResult(success=True, message_id=message_id)
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         data = await self._api_get("rooms.info", {"roomId": chat_id})
         room = data.get("room") if isinstance(data, dict) else None
