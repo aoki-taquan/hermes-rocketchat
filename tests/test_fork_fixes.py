@@ -467,3 +467,98 @@ class TestTypingPause:
             return sent_while_paused
 
         assert run(scenario()) == []
+
+
+class TestStatusUpdates:
+    def test_edits_existing_status_for_same_key(self, make_adapter):
+        """Without this hook the core falls back to send(), so every refresh
+        of "⏳ Working — N min" appends another message."""
+        adapter = make_adapter()
+        adapter.send = AsyncMock(return_value=__import__("gateway.platforms.base", fromlist=["SendResult"]).SendResult(success=True, message_id="s1"))
+        adapter.edit_message = AsyncMock(return_value=__import__("gateway.platforms.base", fromlist=["SendResult"]).SendResult(success=True, message_id="s1"))
+
+        run(adapter.send_or_update_status("room1", "working", "⏳ 1 min"))
+        run(adapter.send_or_update_status("room1", "working", "⏳ 2 min"))
+
+        adapter.send.assert_awaited_once()
+        adapter.edit_message.assert_awaited_once()
+
+    def test_falls_back_to_send_when_edit_fails(self, make_adapter):
+        from gateway.platforms.base import SendResult
+
+        adapter = make_adapter()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="s1"))
+        adapter.edit_message = AsyncMock(return_value=SendResult(success=False, error="gone"))
+
+        run(adapter.send_or_update_status("room1", "working", "a"))
+        run(adapter.send_or_update_status("room1", "working", "b"))
+
+        assert adapter.send.await_count == 2
+
+    def test_separate_keys_do_not_share_a_message(self, make_adapter):
+        from gateway.platforms.base import SendResult
+
+        adapter = make_adapter()
+        adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="s1"))
+        adapter.edit_message = AsyncMock()
+
+        run(adapter.send_or_update_status("room1", "working", "a"))
+        run(adapter.send_or_update_status("room1", "other", "b"))
+
+        assert adapter.send.await_count == 2
+        adapter.edit_message.assert_not_awaited()
+
+
+class TestReactionAck:
+    def test_emojis_are_declared(self, rc_module):
+        """base.on_processing_complete returns immediately when both _OK_EMOJI
+        and _FAIL_EMOJI are None, so the ack flow never runs."""
+        cls = rc_module.RocketChatAdapter
+        assert cls._OK_EMOJI and cls._FAIL_EMOJI
+
+    def test_add_reaction_calls_chat_react(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True})
+
+        assert run(adapter._add_reaction("room1", "msg1", "eyes")) is True
+
+        endpoint, payload = adapter._api_post.await_args.args
+        assert endpoint == "chat.react"
+        assert payload["messageId"] == "msg1"
+        assert payload["shouldReact"] is True
+
+    def test_remove_reaction_clears_each_ack_emoji(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True})
+
+        run(adapter._remove_reaction("room1", "msg1"))
+
+        assert adapter._api_post.await_count == 3  # ack / ok / fail
+        for call in adapter._api_post.await_args_list:
+            assert call.args[1]["shouldReact"] is False
+
+
+class TestListChannels:
+    def test_returns_normalizable_entries(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_get = AsyncMock(return_value={"update": [
+            {"_id": "c1", "t": "c", "name": "general", "fname": "General"},
+            {"_id": "d1", "t": "d", "usernames": ["hermes", "aoki"]},
+            {"_id": "p1", "t": "p", "name": "private"},
+            {"no_id": True},
+        ]})
+
+        channels = run(adapter.list_channels())
+
+        by_id = {c["id"]: c for c in channels}
+        assert by_id["c1"]["name"] == "General"
+        assert by_id["c1"]["type"] == "channel"
+        assert by_id["d1"]["name"] == "aoki"   # the human, not the bot
+        assert by_id["d1"]["type"] == "dm"
+        assert by_id["p1"]["type"] == "group"
+        assert len(channels) == 3              # malformed entry dropped
+
+    def test_handles_unexpected_payload(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_get = AsyncMock(return_value={})
+        assert run(adapter.list_channels()) == []

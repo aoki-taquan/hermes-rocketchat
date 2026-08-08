@@ -145,6 +145,13 @@ class RocketChatAdapter(BasePlatformAdapter):
     # registry entry -- it is not injected back into the adapter.
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
+    # Reaction ack. The base on_processing_complete drives the whole flow
+    # (👀 while working, ✅/❌ on completion) but returns immediately unless at
+    # least one of these is set and _add_reaction/_remove_reaction exist.
+    _ACK_EMOJI: Optional[str] = "eyes"
+    _OK_EMOJI: Optional[str] = "white_check_mark"
+    _FAIL_EMOJI: Optional[str] = "x"
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(PLATFORM_NAME))
 
@@ -171,6 +178,9 @@ class RocketChatAdapter(BasePlatformAdapter):
         self._ws: Any = None  # aiohttp.ClientWebSocketResponse
         # chat_id -> typing refresh task (the indicator expires server-side)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
+        # (chat_id, status_key) -> message id, so a status line is edited in
+        # place instead of appended on every refresh.
+        self._status_message_ids: Dict[Tuple[str, str], str] = {}
         self._ws_task: Optional[asyncio.Task] = None
         self._closing = False
         self._ddp_seq = 0
@@ -622,6 +632,94 @@ class RocketChatAdapter(BasePlatformAdapter):
             "chat.delete", {"roomId": chat_id, "msgId": message_id, "asUser": True}
         )
         return bool(data and data.get("success"))
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Post a status line, editing the previous one for the same key.
+
+        The core routes status updates ("⏳ Working — 3 min", …) through this
+        when present and falls back to plain ``send()`` otherwise
+        (``gateway/run.py``). With the fallback, every refresh appends another
+        message and the room fills up with stale duplicates.
+        """
+        key = (chat_id, status_key)
+        existing = self._status_message_ids.get(key)
+        if existing:
+            result = await self.edit_message(chat_id, existing, content)
+            if result.success:
+                return result
+            # The message was probably deleted underneath us; fall through and
+            # post a fresh one rather than losing the update.
+            self._status_message_ids.pop(key, None)
+
+        result = await self.send(chat_id, content, metadata=metadata)
+        if result.success and result.message_id:
+            self._status_message_ids[key] = str(result.message_id)
+        return result
+
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Add a reaction. Called by the base ack flow in on_processing_complete."""
+        if not message_id or not emoji:
+            return False
+        data = await self._api_post(
+            "chat.react", {"messageId": message_id, "emoji": emoji, "shouldReact": True}
+        )
+        return bool(data and data.get("success"))
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> bool:
+        """Clear the bot's own ack reactions from a message.
+
+        The base flow removes before adding so the result is deterministic
+        whether or not the platform stacks reactions from one sender.
+        """
+        if not message_id:
+            return False
+        ok = True
+        for emoji in (self._ACK_EMOJI, self._OK_EMOJI, self._FAIL_EMOJI):
+            if not emoji:
+                continue
+            data = await self._api_post(
+                "chat.react", {"messageId": message_id, "emoji": emoji, "shouldReact": False}
+            )
+            ok = ok and bool(data and data.get("success"))
+        return ok
+
+    async def list_channels(self) -> List[Dict[str, Any]]:
+        """Enumerate rooms the bot can post to.
+
+        Without this the core falls back to inferring targets from session
+        history, so the agent cannot send to a room it has never been spoken
+        to in (``gateway/channel_directory.py``).
+        """
+        data = await self._api_get("rooms.get")
+        rooms = data.get("update") if isinstance(data, dict) else None
+        if not isinstance(rooms, list):
+            return []
+
+        channels: List[Dict[str, Any]] = []
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            room_id = room.get("_id")
+            if not room_id:
+                continue
+            rtype = _ROOM_TYPE_MAP.get(room.get("t", "c"), "channel")
+            # DMs are named after the participants rather than the room.
+            if rtype == "dm":
+                usernames = room.get("usernames") or []
+                name = next(
+                    (u for u in usernames if u != self._bot_username),
+                    room.get("name") or str(room_id),
+                )
+            else:
+                name = room.get("fname") or room.get("name") or str(room_id)
+            channels.append({"id": str(room_id), "name": str(name), "type": rtype})
+        return channels
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         data = await self._api_get("rooms.info", {"roomId": chat_id})
