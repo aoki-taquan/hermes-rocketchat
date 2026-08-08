@@ -1,0 +1,64 @@
+name: rocketchat-platform
+label: Rocket.Chat
+kind: platform
+manifest_version: 1
+version: 1.1.0
+description: >
+  Rocket.Chat gateway adapter for Hermes Agent. Connects to a self-hosted or
+  cloud Rocket.Chat workspace via the Realtime API (DDP/WebSocket) for
+  receiving and the REST API for sending, relaying messages between
+  Rocket.Chat channels/DMs and the Hermes agent. Supports thread-mode
+  replies, native file uploads, channel-scoped allowlists, @mention gating,
+  and home-channel cron delivery. No Rocket.Chat SDK required — uses aiohttp.
+author: aoki-taquan (fork of wachtelhund/hermes-rocketchat-gateway)
+requires_env:
+  - name: ROCKETCHAT_URL
+    description: "Rocket.Chat server URL (e.g. https://chat.example.com)"
+    prompt: "Rocket.Chat server URL"
+    password: false
+    url: "https://docs.rocket.chat/docs/personal-access-tokens"
+  - name: ROCKETCHAT_USER_ID
+    description: "Bot user id (shown next to the Personal Access Token)"
+    prompt: "Bot user id"
+    password: false
+  - name: ROCKETCHAT_TOKEN
+    description: "Bot Personal Access Token"
+    prompt: "Rocket.Chat Personal Access Token"
+    password: true
+optional_env:
+  - name: ROCKETCHAT_USERNAME
+    description: "Bot username (password-login fallback if no token)"
+    prompt: "Bot username"
+    password: false
+  - name: ROCKETCHAT_PASSWORD
+    description: "Bot password (password-login fallback if no token)"
+    prompt: "Bot password"
+    password: true
+  - name: ROCKETCHAT_ALLOWED_USERS
+    description: "Comma-separated usernames/ids allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: ROCKETCHAT_ALLOW_ALL_USERS
+    description: "Allow any Rocket.Chat user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: ROCKETCHAT_HOME_CHANNEL
+    description: "Default room id for cron / notification delivery"
+    prompt: "Home room id"
+    password: false
+  - name: ROCKETCHAT_REPLY_MODE
+    description: "How replies are sent: 'thread' (nested) or 'off' (flat). Default: off."
+    prompt: "Reply mode (thread|off)"
+    password: false
+  - name: ROCKETCHAT_REQUIRE_MENTION
+    description: "Require @bot mention in channels (default true). Set false for free-response everywhere."
+    prompt: "Require @mention? (true/false)"
+    password: false
+  - name: ROCKETCHAT_FREE_RESPONSE_CHANNELS
+    description: "Comma-separated room ids where @mention is not required."
+    prompt: "Free-response room ids (comma-separated)"
+    password: false
+  - name: ROCKETCHAT_ALLOWED_CHANNELS
+    description: "If set, the bot only responds in these room ids (whitelist)."
+    prompt: "Allowed room ids (comma-separated)"
+    password: false

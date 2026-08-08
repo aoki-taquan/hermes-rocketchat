@@ -1,0 +1,41 @@
+# Minimal Rocket.Chat stack for live end-to-end testing of the gateway.
+#
+#   docker compose -f tests/e2e/docker-compose.yml up -d
+#   # wait until http://localhost:3000 is up (admin/admin1234), then:
+#   HERMES_AGENT=~/.hermes/hermes-agent PYTHONPATH=$HERMES_AGENT \
+#     "$HERMES_AGENT/venv/bin/python" tests/e2e/test_live.py
+#   docker compose -f tests/e2e/docker-compose.yml down -v
+#
+# The mongodb healthcheck auto-initiates the single-node replica set that
+# Rocket.Chat requires.
+services:
+  mongodb:
+    image: mongo:6.0
+    command: mongod --replSet rs0 --bind_ip_all --oplogSize 128
+    healthcheck:
+      test: >
+        echo "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongodb:27017'}]}).ok }"
+        | mongosh --quiet
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+  rocketchat:
+    image: rocketchat/rocket.chat:6.5.0
+    ports:
+      - "13000:3000"
+    environment:
+      ROOT_URL: http://localhost:13000
+      PORT: "3000"
+      MONGO_URL: "mongodb://mongodb:27017/rocketchat?replicaSet=rs0"
+      MONGO_OPLOG_URL: "mongodb://mongodb:27017/local?replicaSet=rs0"
+      DEPLOY_METHOD: docker
+      ADMIN_USERNAME: admin
+      ADMIN_PASS: admin1234
+      ADMIN_EMAIL: admin@example.com
+      OVERWRITE_SETTING_Show_Setup_Wizard: completed
+      OVERWRITE_SETTING_Iframe_Restrict_Access: "false"
+    depends_on:
+      mongodb:
+        condition: service_healthy

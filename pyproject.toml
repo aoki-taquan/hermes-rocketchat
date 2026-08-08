@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# The repo root ships an __init__.py (required by the Hermes plugin loader),
+# which the default "prepend" import mode mistakes for an importable package.
+# importlib mode imports test modules by path and avoids that.
+addopts = "--import-mode=importlib"
+testpaths = ["tests"]
