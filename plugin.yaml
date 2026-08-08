@@ -35,7 +35,7 @@ optional_env:
     prompt: "Bot password"
     password: true
   - name: ROCKETCHAT_ALLOWED_USERS
-    description: "Comma-separated usernames/ids allowed to talk to the bot"
+    description: "Comma-separated Rocket.Chat user ids allowed to talk to the bot (usernames do not match)"
     prompt: "Allowed users (comma-separated)"
     password: false
   - name: ROCKETCHAT_ALLOW_ALL_USERS

@@ -108,7 +108,7 @@ Next steps:
        ROCKETCHAT_USER_ID=<bot user id>
        ROCKETCHAT_TOKEN=<personal access token>
        # optional, recommended:
-       ROCKETCHAT_ALLOWED_USERS=<your username>
+       ROCKETCHAT_ALLOWED_USERS=<your user id>
        ROCKETCHAT_HOME_CHANNEL=<room id for cron delivery>
 
   3. Invite the bot to a channel (or DM it), then start the gateway:

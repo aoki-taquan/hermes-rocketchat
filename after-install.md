@@ -6,7 +6,7 @@ Set these in `~/.hermes/.env`, then run `hermes gateway restart`:
 ROCKETCHAT_URL=https://chat.example.com
 ROCKETCHAT_USER_ID=<bot user id>
 ROCKETCHAT_TOKEN=<personal access token>
-ROCKETCHAT_ALLOWED_USERS=<your username>   # recommended
+ROCKETCHAT_ALLOWED_USERS=<your user id>    # recommended (user id, NOT username)
 ROCKETCHAT_HOME_CHANNEL=<room id>          # optional, for cron delivery
 ```
 

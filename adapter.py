@@ -25,7 +25,8 @@ Authentication (set in ``~/.hermes/.env``):
 
 Optional:
 
-    ROCKETCHAT_ALLOWED_USERS         Comma-separated usernames/ids allowed to talk to the bot
+    ROCKETCHAT_ALLOWED_USERS         Comma-separated Rocket.Chat *user ids* allowed to
+                                     talk to the bot (usernames do NOT match)
     ROCKETCHAT_ALLOW_ALL_USERS       Allow any user (dev only)
     ROCKETCHAT_HOME_CHANNEL          Room id for cron / notification delivery
     ROCKETCHAT_REPLY_MODE            'thread' (nested) or 'off' (flat, default)
@@ -43,6 +44,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
@@ -80,6 +82,17 @@ _RECONNECT_JITTER = 0.2
 # If the DDP login+subscribe handshake doesn't complete within this window,
 # the socket is torn down and reconnected (avoids a live-but-deaf connection).
 _HANDSHAKE_TIMEOUT = 30.0
+
+# Ceiling on a single inbound attachment. The body is read into memory before
+# being cached, so an unbounded read is a trivial DoS.
+_MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024
+
+# Rocket.Chat expires a typing indicator after ~15s; its own client refreshes
+# roughly every 10s. Anything much faster is pointless DDP traffic.
+_TYPING_REFRESH_INTERVAL = 8.0
+
+# Backstop so a missed stop_typing can never leave a task spinning forever.
+_TYPING_MAX_DURATION = 300.0
 
 
 def check_rocketchat_requirements() -> bool:
@@ -135,8 +148,8 @@ class RocketChatAdapter(BasePlatformAdapter):
 
         self._session: Any = None  # aiohttp.ClientSession
         self._ws: Any = None  # aiohttp.ClientWebSocketResponse
-        # chat_id -> typing refresh task (Rocket.Chat の typing は数秒で消える)
-        self._typing_tasks: Dict[str, Any] = {}
+        # chat_id -> typing refresh task (the indicator expires server-side)
+        self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._ws_task: Optional[asyncio.Task] = None
         self._closing = False
         self._ddp_seq = 0
@@ -244,13 +257,33 @@ class RocketChatAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Connect to Rocket.Chat.
+
+        ``is_reconnect`` is passed by the Hermes core (``gateway/run.py``) when
+        it re-establishes a dropped platform. The core calls
+        ``adapter.connect(is_reconnect=...)`` unconditionally, so **this
+        keyword must stay even though the body only uses it for logging** --
+        removing it makes the plugin fail to load with a TypeError.
+        """
         import aiohttp
 
         if not self._base_url:
             logger.error("Rocket.Chat: ROCKETCHAT_URL not configured")
             return False
 
+        # The core may reconnect without calling disconnect() first. Without
+        # this teardown the previous ClientSession leaks and the old _ws_loop
+        # keeps running, so two loops end up fighting over self._ws and the
+        # room subscription is duplicated.
+        if self._session is not None or self._ws_task is not None:
+            logger.info(
+                "Rocket.Chat: %s - tearing down the previous connection",
+                "reconnecting" if is_reconnect else "connect() called while connected",
+            )
+            await self.disconnect()
+
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        # Must follow disconnect(), which sets _closing = True.
         self._closing = False
 
         # If we only have username/password, log in via REST to obtain the
@@ -312,40 +345,77 @@ class RocketChatAdapter(BasePlatformAdapter):
             return False
 
     async def _notify_typing(self, chat_id: str, is_typing: bool) -> None:
-        """Send a Rocket.Chat typing notification over DDP."""
+        """Tell Rocket.Chat whether the bot is composing a message.
+
+        Two events are emitted because the wire format changed: Rocket.Chat 4.x
+        moved to the ``UserAction`` module and modern clients render
+        ``<rid>/user-activity``, while older ones only understand
+        ``<rid>/typing``. Both are cheap, so send both rather than probing the
+        server version.
+        """
         ws = self._ws
         if ws is None or getattr(ws, "closed", True):
             return
         name = self._bot_username or self._username
         if not name:
+            logger.debug("Rocket.Chat: no bot username resolved, skipping typing notify")
             return
+        activities = ["user-typing"] if is_typing else []
         try:
+            await ws.send_json({
+                "msg": "method",
+                "method": "stream-notify-room",
+                "id": self._next_seq(),
+                "params": [f"{chat_id}/user-activity", name, activities, {}],
+            })
             await ws.send_json({
                 "msg": "method",
                 "method": "stream-notify-room",
                 "id": self._next_seq(),
                 "params": [f"{chat_id}/typing", name, bool(is_typing)],
             })
-        except Exception:
-            # typing は表示上の演出でしかない。失敗しても本処理は続ける。
-            pass
+        except Exception as exc:
+            # The indicator is cosmetic; never let it break message handling.
+            # Logged because a silent failure here is indistinguishable from
+            # "the server ignored us".
+            logger.debug("Rocket.Chat: typing notify failed for %s: %s", chat_id, exc)
 
     async def _typing_loop(self, chat_id: str) -> None:
-        """Rocket.Chat の typing 表示は数秒で消えるので打ち直し続ける。"""
-        try:
-            while True:
-                await self._notify_typing(chat_id, True)
-                await asyncio.sleep(3.0)
-        except asyncio.CancelledError:
-            raise
+        """Keep the indicator alive; Rocket.Chat expires it after a few seconds.
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        Bounded by ``_TYPING_MAX_DURATION`` so that a missed ``stop_typing``
+        (an exception in the core between start and stop, say) cannot leave a
+        task spinning and the room stuck on "typing" forever.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TYPING_MAX_DURATION
+        try:
+            while loop.time() < deadline:
+                await self._notify_typing(chat_id, True)
+                await asyncio.sleep(_TYPING_REFRESH_INTERVAL)
+            logger.warning(
+                "Rocket.Chat: typing indicator for %s expired after %.0fs "
+                "(stop_typing was never called)", chat_id, _TYPING_MAX_DURATION,
+            )
+            await self._notify_typing(chat_id, False)
+        finally:
+            # Deregister, but only if we are still the registered task -- a
+            # replacement must not be evicted by its predecessor.
+            if self._typing_tasks.get(chat_id) is asyncio.current_task():
+                self._typing_tasks.pop(chat_id, None)
+
+    async def send_typing(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
         task = self._typing_tasks.get(chat_id)
         if task and not task.done():
             return
-        await self._notify_typing(chat_id, True)
-        self._typing_tasks[chat_id] = asyncio.ensure_future(
-            self._typing_loop(chat_id)
+        # Register synchronously: an await between the check and the assignment
+        # would let two concurrent callers both start a loop, and the loser
+        # would be unreachable to stop_typing/disconnect. The loop sends the
+        # first notification itself.
+        self._typing_tasks[chat_id] = asyncio.create_task(
+            self._typing_loop(chat_id), name=f"rc-typing-{chat_id}",
         )
 
     async def stop_typing(self, chat_id: str) -> None:
@@ -354,16 +424,29 @@ class RocketChatAdapter(BasePlatformAdapter):
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except asyncio.CancelledError:
+                # Only swallow the cancellation we caused; if this coroutine is
+                # itself being cancelled, that must propagate.
+                if not task.cancelled():
+                    raise
+            except Exception as exc:
+                logger.debug("Rocket.Chat: typing loop ended with error: %s", exc)
         await self._notify_typing(chat_id, False)
 
     async def disconnect(self) -> None:
         self._closing = True
-        for _cid in list(self._typing_tasks):
-            _t = self._typing_tasks.pop(_cid, None)
-            if _t and not _t.done():
-                _t.cancel()
+        # Best-effort: clear the indicator while the socket is still open.
+        for chat_id in list(self._typing_tasks):
+            await self._notify_typing(chat_id, False)
+        typing_tasks = [t for t in self._typing_tasks.values() if t and not t.done()]
+        self._typing_tasks.clear()
+        for task in typing_tasks:
+            task.cancel()
+        if typing_tasks:
+            # Awaiting matters: cancel() only schedules the cancellation, and
+            # closing the loop with it still pending raises
+            # "Task was destroyed but it is pending!".
+            await asyncio.gather(*typing_tasks, return_exceptions=True)
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -822,24 +905,106 @@ class RocketChatAdapter(BasePlatformAdapter):
             channel_prompt=channel_prompt,
         ))
 
+    def _resolve_attachment_url(self, rel: str) -> Tuple[Optional[str], bool]:
+        """Resolve an attachment reference to a URL we are willing to fetch.
+
+        Returns ``(url, same_origin)``; ``(None, False)`` means "do not fetch".
+        Relative references resolve against our own server. Absolute ones are
+        only allowed when they point at that same origin, or -- for genuinely
+        external links -- when they pass Hermes' SSRF filter, in which case they
+        are fetched without credentials.
+        """
+        rel = str(rel)
+        if not rel.startswith(("http://", "https://")):
+            # Relative to our own server. Guard against "//evil.example/x",
+            # which urljoin would happily treat as a protocol-relative URL.
+            if rel.startswith("//"):
+                logger.warning("Rocket.Chat: refused protocol-relative attachment URL")
+                return None, False
+            return urljoin(self._base_url + "/", rel.lstrip("/")), True
+
+        try:
+            target = urlparse(rel)
+            ours = urlparse(self._base_url)
+        except ValueError:
+            logger.warning("Rocket.Chat: refused malformed attachment URL")
+            return None, False
+
+        if (target.scheme, target.netloc) == (ours.scheme, ours.netloc):
+            return rel, True
+
+        # Someone else's host: never send credentials, and only proceed if the
+        # target is not an internal address (link previews legitimately point
+        # outward, so this is not an error).
+        try:
+            from tools.url_safety import is_safe_url
+        except ImportError:
+            logger.warning("Rocket.Chat: url_safety unavailable, skipping external attachment")
+            return None, False
+        if not is_safe_url(rel):
+            logger.warning("Rocket.Chat: blocked unsafe attachment URL (SSRF protection)")
+            return None, False
+        return rel, False
+
     async def _cache_attachment(
         self, att: Dict[str, Any], media_urls: List[str], media_types: List[str],
     ) -> None:
-        """Download a single Rocket.Chat attachment into the local cache."""
+        """Download a single Rocket.Chat attachment into the local cache.
+
+        SECURITY: ``att`` comes straight off the wire and every field in it is
+        attacker-controlled. Rocket.Chat's own link preview fills ``title_link``
+        / ``image_url`` with arbitrary external URLs the moment anyone posts a
+        link, so this runs on untrusted input by design. Two rules follow:
+
+        1. The bot's Personal Access Token goes out **only** to our own server.
+           Sending it anywhere else hands over the bot account.
+        2. Only same-origin URLs are fetched at all, and redirects are refused,
+           so this cannot be turned into an SSRF probe against the host network.
+
+        Note this runs *before* the core authorizes the sender
+        (``ROCKETCHAT_ALLOWED_USERS``), so the allowlist is not a mitigation.
+        """
         import aiohttp
         rel = att.get("image_url") or att.get("audio_url") or att.get("video_url") or att.get("title_link")
         if not rel:
             return
-        dl_url = rel if rel.startswith("http") else f"{self._base_url}{rel}"
+
+        dl_url, same_origin = self._resolve_attachment_url(rel)
+        if dl_url is None:
+            return
+
         try:
             async with self._session.get(
-                dl_url, headers=self._auth_headers(),
+                dl_url,
+                # Credentials only ever leave for our own origin.
+                headers=self._auth_headers() if same_origin else None,
+                # A redirect would carry the headers to whatever host it names.
+                allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    logger.warning(
+                        "Rocket.Chat: attachment download refused (redirect to another host)"
+                    )
+                    return
                 if resp.status >= 400:
                     logger.warning("Rocket.Chat: attachment download failed (HTTP %s)", resp.status)
                     return
-                data = await resp.read()
+                declared = resp.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > _MAX_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "Rocket.Chat: attachment too large (%s bytes, limit %s)",
+                        declared, _MAX_ATTACHMENT_BYTES,
+                    )
+                    return
+                # Content-Length can lie or be absent; cap the actual read too.
+                data = await resp.content.read(_MAX_ATTACHMENT_BYTES + 1)
+                if len(data) > _MAX_ATTACHMENT_BYTES:
+                    logger.warning(
+                        "Rocket.Chat: attachment exceeded %s bytes, discarded",
+                        _MAX_ATTACHMENT_BYTES,
+                    )
+                    return
                 mime = resp.content_type or att.get("image_type") or "application/octet-stream"
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning("Rocket.Chat: attachment download error: %s", exc)
@@ -848,7 +1013,9 @@ class RocketChatAdapter(BasePlatformAdapter):
         from gateway.platforms.base import (
             cache_image_from_bytes, cache_audio_from_bytes, cache_document_from_bytes,
         )
-        fname = att.get("title") or rel.rsplit("/", 1)[-1].split("?")[0] or "file"
+        raw_name = att.get("title") or rel.rsplit("/", 1)[-1].split("?")[0] or "file"
+        # Strip any directory component -- the name reaches a file write downstream.
+        fname = Path(str(raw_name)).name or "file"
         ext = Path(fname).suffix
         # Caching can raise (e.g. cache_image_from_bytes on non-image bytes such
         # as an HTML error page served with an image/* content-type). Don't let
