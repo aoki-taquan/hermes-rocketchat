@@ -124,6 +124,27 @@ def check_rocketchat_requirements() -> bool:
 class RocketChatAdapter(BasePlatformAdapter):
     """Gateway adapter for Rocket.Chat (self-hosted or cloud)."""
 
+    # --- Capability flags -------------------------------------------------
+    # The core reads these off the class with getattr(), so leaving them unset
+    # silently degrades behaviour rather than raising.
+
+    # send() already chunks with truncate_message(). Without this flag the
+    # delivery router assumes we cannot and replaces any output over 4000
+    # characters with a "[truncated, full output saved to <path>]" file
+    # reference -- cron results in particular arrive gutted (gateway/delivery.py).
+    splits_long_messages = True
+
+    # Rocket.Chat renders standard Markdown, so tool progress can use fenced
+    # code blocks instead of a 40-character inline preview (gateway/run.py).
+    supports_code_blocks = True
+
+    # Must be a class attribute: the core reads it via
+    # getattr(self, "MAX_MESSAGE_LENGTH", 4096) and would otherwise size
+    # progress bubbles to 4096 while our own edit path trims at 4000,
+    # quietly losing the tail. register(max_message_length=...) only fills the
+    # registry entry -- it is not injected back into the adapter.
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(PLATFORM_NAME))
 
@@ -282,6 +303,22 @@ class RocketChatAdapter(BasePlatformAdapter):
             )
             await self.disconnect()
 
+        # Single-instance guard, as every bundled adapter does (Discord, Slack,
+        # Telegram, Signal, ...). Two gateways sharing one bot account both
+        # receive every message over DDP and both answer it, so the room sees
+        # duplicate replies. Non-fatal: a lock backend problem should not stop
+        # a legitimate single instance from starting.
+        try:
+            if not self._acquire_platform_lock(
+                "rocketchat-bot", f"{self._base_url}#{self._user_id}", "Rocket.Chat bot account"
+            ):
+                logger.error(
+                    "Rocket.Chat: another gateway already holds this bot account; refusing to connect"
+                )
+                return False
+        except Exception as exc:
+            logger.warning("Rocket.Chat: could not acquire bot lock (non-fatal): %s", exc)
+
         self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         # Must follow disconnect(), which sets _closing = True.
         self._closing = False
@@ -389,8 +426,20 @@ class RocketChatAdapter(BasePlatformAdapter):
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _TYPING_MAX_DURATION
+        paused = False
         try:
             while loop.time() < deadline:
+                # The core parks the indicator while it waits on the user
+                # (dangerous-command approval, for one) via
+                # pause_typing_for_chat(). Ignoring it leaves "typing" up for
+                # the whole wait, which reads as a hung agent.
+                if chat_id in self._typing_paused:
+                    if not paused:
+                        await self._notify_typing(chat_id, False)
+                        paused = True
+                    await asyncio.sleep(_TYPING_REFRESH_INTERVAL)
+                    continue
+                paused = False
                 await self._notify_typing(chat_id, True)
                 await asyncio.sleep(_TYPING_REFRESH_INTERVAL)
             logger.warning(
@@ -492,10 +541,16 @@ class RocketChatAdapter(BasePlatformAdapter):
         chunks = self.truncate_message(formatted, MAX_MESSAGE_LENGTH)
 
         tmid: Optional[str] = None
-        if reply_to and self._reply_mode == "thread":
+        # An explicit thread from the core (progress bubbles, status updates,
+        # cron delivery) wins. Inbound messages carry the thread they arrived
+        # in as source.thread_id, so honouring this keeps a conversation that
+        # started in a thread from spilling into the channel.
+        if metadata:
+            tmid = metadata.get("thread_id") or metadata.get("tmid") or None
+        if not tmid and reply_to and self._reply_mode == "thread":
             tmid = await self._resolve_thread_root(reply_to)
 
-        last_id = None
+        message_ids: List[str] = []
         for chunk in chunks:
             message: Dict[str, Any] = {"rid": chat_id, "msg": chunk}
             if tmid:
@@ -503,9 +558,20 @@ class RocketChatAdapter(BasePlatformAdapter):
             data = await self._api_post("chat.sendMessage", {"message": message})
             if not data or not data.get("success", bool(data.get("message"))):
                 return SendResult(success=False, error="Failed to send message")
-            last_id = (data.get("message") or {}).get("_id")
+            sent_id = (data.get("message") or {}).get("_id")
+            if sent_id:
+                message_ids.append(str(sent_id))
 
-        return SendResult(success=True, message_id=last_id)
+        # Expose every id, not just the last one. Cleanup and preview tracking
+        # read the extras from raw_response["message_ids"]
+        # (stream_consumer._track_preview_ids_from_result); SendResult itself
+        # has no continuation field. Returning only the final chunk's id left
+        # the earlier chunks undeletable.
+        return SendResult(
+            success=True,
+            message_id=message_ids[-1] if message_ids else None,
+            raw_response={"message_ids": message_ids} if len(message_ids) > 1 else None,
+        )
 
     async def edit_message(
         self,

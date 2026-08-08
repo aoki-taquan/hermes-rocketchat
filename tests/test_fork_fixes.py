@@ -350,3 +350,120 @@ class TestDeleteMessage:
         adapter = make_adapter()
         adapter._api_post = AsyncMock(return_value={"success": False})
         assert run(adapter.delete_message("room1", "msg1")) is False
+
+
+# ---------------------------------------------------------------------------
+# Capability flags read off the class with getattr()
+# ---------------------------------------------------------------------------
+
+class TestCapabilityFlags:
+    def test_declares_it_splits_long_messages(self, rc_module):
+        """send() chunks via truncate_message. Without the flag the delivery
+        router replaces >4000 char output with a file reference instead."""
+        assert rc_module.RocketChatAdapter.splits_long_messages is True
+
+    def test_declares_code_block_support(self, rc_module):
+        """Rocket.Chat renders Markdown; without this tool progress falls back
+        to a short inline preview instead of a fenced block."""
+        assert rc_module.RocketChatAdapter.supports_code_blocks is True
+
+    def test_max_message_length_is_a_class_attribute(self, rc_module):
+        """The core reads it with getattr(self, "MAX_MESSAGE_LENGTH", 4096).
+        As a module-level constant only, it would size progress bubbles to
+        4096 while our edit path trims at 4000, dropping the tail."""
+        assert (
+            getattr(rc_module.RocketChatAdapter, "MAX_MESSAGE_LENGTH", None)
+            == rc_module.MAX_MESSAGE_LENGTH
+        )
+
+
+# ---------------------------------------------------------------------------
+# send(): threading and multi-chunk ids
+# ---------------------------------------------------------------------------
+
+class TestSendThreadingAndIds:
+    def test_metadata_thread_id_is_honoured(self, make_adapter):
+        """Inbound messages carry their thread as source.thread_id. Ignoring it
+        made progress and answers land in the channel instead of the thread."""
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True, "message": {"_id": "m1"}})
+
+        run(adapter.send("room1", "hi", metadata={"thread_id": "root1"}))
+
+        _, payload = adapter._api_post.await_args.args
+        assert payload["message"]["tmid"] == "root1"
+
+    def test_no_thread_when_not_requested(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True, "message": {"_id": "m1"}})
+
+        run(adapter.send("room1", "hi"))
+
+        _, payload = adapter._api_post.await_args.args
+        assert "tmid" not in payload["message"]
+
+    def test_split_message_exposes_every_id(self, make_adapter, rc_module):
+        """Cleanup reads the extras from raw_response["message_ids"]; returning
+        only the final chunk's id left earlier chunks undeletable."""
+        adapter = make_adapter()
+        ids = iter(["m1", "m2", "m3"])
+        adapter._api_post = AsyncMock(
+            side_effect=lambda *a, **k: {"success": True, "message": {"_id": next(ids)}}
+        )
+
+        result = run(adapter.send("room1", "x" * (rc_module.MAX_MESSAGE_LENGTH * 2 + 10)))
+
+        assert result.success is True
+        assert adapter._api_post.await_count >= 2
+        tracked = (result.raw_response or {}).get("message_ids")
+        assert tracked and len(tracked) == adapter._api_post.await_count
+
+    def test_single_chunk_has_no_continuation(self, make_adapter):
+        adapter = make_adapter()
+        adapter._api_post = AsyncMock(return_value={"success": True, "message": {"_id": "m1"}})
+        result = run(adapter.send("room1", "short"))
+        assert result.message_id == "m1"
+        assert result.raw_response is None
+
+
+# ---------------------------------------------------------------------------
+# Single-instance guard / typing pause
+# ---------------------------------------------------------------------------
+
+class TestPlatformLock:
+    def test_connect_refuses_when_lock_is_held(self, make_adapter):
+        """Two gateways on one bot account both receive every message over DDP
+        and both answer, so the room sees duplicate replies."""
+        adapter = make_adapter()
+        adapter._acquire_platform_lock = MagicMock(return_value=False)
+        assert run(adapter.connect()) is False
+        adapter._acquire_platform_lock.assert_called_once()
+
+    def test_lock_backend_failure_is_non_fatal(self, make_adapter):
+        """A lock backend problem must not stop a legitimate single instance."""
+        adapter = make_adapter()
+        adapter._acquire_platform_lock = MagicMock(side_effect=RuntimeError("boom"))
+        adapter._base_url = ""  # stop right after the lock step
+        assert run(adapter.connect()) is False  # refused for the URL, not the lock
+
+
+class TestTypingPause:
+    def test_loop_stops_emitting_while_paused(self, make_adapter):
+        """The core parks typing during approval waits via
+        pause_typing_for_chat(); ignoring it leaves 'typing' up the whole time."""
+        adapter = make_adapter()
+        ws = FakeWS()
+        adapter._ws = ws
+
+        async def scenario():
+            adapter.pause_typing_for_chat("room1")
+            await adapter.send_typing("room1")
+            await asyncio.sleep(0.05)
+            sent_while_paused = [
+                p for p in ws.sent
+                if p["params"][0] == "room1/user-activity" and p["params"][2] == ["user-typing"]
+            ]
+            await adapter.stop_typing("room1")
+            return sent_while_paused
+
+        assert run(scenario()) == []
